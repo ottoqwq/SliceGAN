@@ -1,15 +1,14 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import tensorflow as tf
 import pickle
-def slicegan_nets(pth, Training, imtype, dk,ds,df,dp,gk,gs,gf,gp):
+
+def slicegan_nets(pth, Training, imtype, dk, ds, df, dp, gk, gs, gf, gp):
     """
     Define a generator and Discriminator
     :param Training: If training, we save params, if not, we load params from previous.
     This keeps the parameters consistent for older models
     :return:
     """
-    #save params
+    # save params
     params = [dk, ds, df, dp, gk, gs, gf, gp]
     # if fresh training, save params
     if Training:
@@ -20,51 +19,51 @@ def slicegan_nets(pth, Training, imtype, dk,ds,df,dp,gk,gs,gf,gp):
     else:
         with open(pth + '_params.data', 'rb') as filehandle:
             # read the data as binary data stream
-            dk, ds, df, dp, gk, gs, gf, gp  = pickle.load(filehandle)
-
+            dk, ds, df, dp, gk, gs, gf, gp = pickle.load(filehandle)
 
     # Make nets
-    class Generator(nn.Module):
+    class Generator(tf.keras.Model):
         def __init__(self):
             super(Generator, self).__init__()
-            self.convs = nn.ModuleList()
-            self.bns = nn.ModuleList()
-            for lay, (k,s,p) in enumerate(zip(gk,gs,gp)):
-                self.convs.append(nn.ConvTranspose3d(gf[lay], gf[lay+1], k, s, p, bias=False))
-                self.bns.append(nn.BatchNorm3d(gf[lay+1]))
+            self.convs = []
+            self.bns = []
+            for lay, (k, s, p) in enumerate(zip(gk, gs, gp)):
+                self.convs.append(tf.keras.layers.Conv3DTranspose(gf[lay + 1], k, s, padding='same', use_bias=False))
+                self.bns.append(tf.keras.layers.BatchNormalization())
 
-        def forward(self, x):
-            for conv,bn in zip(self.convs[:-1],self.bns[:-1]):
-                x = F.relu_(bn(conv(x)))
-            #use tanh if colour or grayscale, otherwise softmax for one hot encoded
+        def call(self, x):
+            for conv, bn in zip(self.convs[:-1], self.bns[:-1]):
+                x = tf.nn.relu(bn(conv(x)))
+            # use tanh if colour or grayscale, otherwise softmax for one hot encoded
             if imtype in ['grayscale', 'colour']:
-                out = 0.5*(torch.tanh(self.convs[-1](x))+1)
+                out = 0.5 * (tf.tanh(self.convs[-1](x)) + 1)
             else:
-                out = torch.softmax(self.convs[-1](x),1)
+                out = tf.nn.softmax(self.convs[-1](x), axis=1)
             return out
 
-    class Discriminator(nn.Module):
+    class Discriminator(tf.keras.Model):
         def __init__(self):
             super(Discriminator, self).__init__()
-            self.convs = nn.ModuleList()
+            self.convs = []
             for lay, (k, s, p) in enumerate(zip(dk, ds, dp)):
-                self.convs.append(nn.Conv2d(df[lay], df[lay + 1], k, s, p, bias=False))
+                self.convs.append(tf.keras.layers.Conv2D(df[lay + 1], k, s, padding='same', use_bias=False))
 
-        def forward(self, x):
+        def call(self, x):
             for conv in self.convs[:-1]:
-                x = F.relu_(conv(x))
+                x = tf.nn.relu(conv(x))
             x = self.convs[-1](x)
             return x
 
     return Discriminator, Generator
-def slicegan_rc_nets(pth, Training, imtype, dk,ds,df,dp,gk,gs,gf,gp):
+
+def slicegan_rc_nets(pth, Training, imtype, dk, ds, df, dp, gk, gs, gf, gp):
     """
     Define a generator and Discriminator
     :param Training: If training, we save params, if not, we load params from previous.
     This keeps the parameters consistent for older models
     :return:
     """
-    #save params
+    # save params
     params = [dk, ds, df, dp, gk, gs, gf, gp]
     # if fresh training, save params
     if Training:
@@ -75,42 +74,38 @@ def slicegan_rc_nets(pth, Training, imtype, dk,ds,df,dp,gk,gs,gf,gp):
     else:
         with open(pth + '_params.data', 'rb') as filehandle:
             # read the data as binary data stream
-            dk, ds, df, dp, gk, gs, gf, gp  = pickle.load(filehandle)
-
+            dk, ds, df, dp, gk, gs, gf, gp = pickle.load(filehandle)
 
     # Make nets
-    class Generator(nn.Module):
+    class Generator(tf.keras.Model):
         def __init__(self):
             super(Generator, self).__init__()
-            self.convs = nn.ModuleList()
-            self.bns = nn.ModuleList()
-            self.rcconv = nn.Conv3d(gf[-2],gf[-1],3,1,0)
-            for lay, (k,s,p) in enumerate(zip(gk,gs,gp)):
-                self.convs.append(nn.ConvTranspose3d(gf[lay], gf[lay+1], k, s, p, bias=False))
-                self.bns.append(nn.BatchNorm3d(gf[lay+1]))
-                # self.bns.append(nn.InstanceNorm3d(gf[lay+1]))
+            self.convs = []
+            self.bns = []
+            self.rcconv = tf.keras.layers.Conv3D(gf[-1], 3, 1, padding='valid')
+            for lay, (k, s, p) in enumerate(zip(gk, gs, gp)):
+                self.convs.append(tf.keras.layers.Conv3DTranspose(gf[lay + 1], k, s, padding='same', use_bias=False))
+                self.bns.append(tf.keras.layers.BatchNormalization())
 
-        def forward(self, x):
-            for lay, (conv, bn) in enumerate(zip(self.convs[:-1],self.bns[:-1])):
-                x = F.relu_(bn(conv(x)))
-            size = (int(x.shape[2]-1,)*2,int(x.shape[3]-1,)*2,int(x.shape[3]-1,)*2)
-            up = nn.Upsample(size=size, mode='trilinear', align_corners=False)
-            out = torch.softmax(self.rcconv(up(x)), 1)
-            # print(out.shape)
+        def call(self, x):
+            for lay, (conv, bn) in enumerate(zip(self.convs[:-1], self.bns[:-1])):
+                x = tf.nn.relu(bn(conv(x)))
+            size = (int(x.shape[1] - 1,) * 2, int(x.shape[2] - 1,) * 2, int(x.shape[3] - 1,) * 2)
+            x = tf.image.resize(x, size, method=tf.image.ResizeMethod.BILINEAR)
+            out = tf.nn.softmax(self.rcconv(x), axis=1)
             return out
 
-    class Discriminator(nn.Module):
+    class Discriminator(tf.keras.Model):
         def __init__(self):
             super(Discriminator, self).__init__()
-            self.convs = nn.ModuleList()
+            self.convs = []
             for lay, (k, s, p) in enumerate(zip(dk, ds, dp)):
-                self.convs.append(nn.Conv2d(df[lay], df[lay + 1], k, s, p, bias=False))
+                self.convs.append(tf.keras.layers.Conv2D(df[lay + 1], k, s, padding='same', use_bias=False))
 
-        def forward(self, x):
+        def call(self, x):
             for conv in self.convs[:-1]:
-                x = F.relu_(conv(x))
+                x = tf.nn.relu(conv(x))
             x = self.convs[-1](x)
             return x
 
     return Discriminator, Generator
-    
