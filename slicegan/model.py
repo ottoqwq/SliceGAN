@@ -1,8 +1,5 @@
 from slicegan import preprocessing, util
-import torch
-import torch.nn as nn
-import torch.backends.cudnn as cudnn
-import torch.optim as optim
+import tensorflow as tf
 import time
 import matplotlib
 
@@ -11,7 +8,7 @@ def train(pth, imtype, datatype, real_data, Disc, Gen, nc, l, nz, sf):
     train the generator
     :param pth: path to save all files, imgs and data
     :param imtype: image type e.g nphase, colour or gray
-    :param datatype: training data format e.g. tif, jpg ect
+    :param datatype: training data format e.g. png, jpg ect
     :param real_data: path to training data
     :param Disc:
     :param Gen:
@@ -45,35 +42,28 @@ def train(pth, imtype, datatype, real_data, Disc, Gen, nc, l, nz, sf):
     beta2 = 0.99
     Lambda = 10
     critic_iters = 5
-    cudnn.benchmark = True
     workers = 0
     lz = 4
     ##Dataloaders for each orientation
-    device = torch.device("cuda:0" if(torch.cuda.is_available() and ngpu > 0) else "cpu")
+    device = '/GPU:0' if tf.test.is_gpu_available() else '/CPU:0'
     print(device, " will be used.\n")
 
     # D trained using different data for x, y and z directions
-    dataloaderx = torch.utils.data.DataLoader(dataset_xyz[0], batch_size=batch_size,
-                                              shuffle=True, num_workers=workers)
-    dataloadery = torch.utils.data.DataLoader(dataset_xyz[1], batch_size=batch_size,
-                                              shuffle=True, num_workers=workers)
-    dataloaderz = torch.utils.data.DataLoader(dataset_xyz[2], batch_size=batch_size,
-                                              shuffle=True, num_workers=workers)
+    dataloaderx = tf.data.Dataset.from_tensor_slices(dataset_xyz[0]).shuffle(buffer_size=len(dataset_xyz[0])).batch(batch_size)
+    dataloadery = tf.data.Dataset.from_tensor_slices(dataset_xyz[1]).shuffle(buffer_size=len(dataset_xyz[1])).batch(batch_size)
+    dataloaderz = tf.data.Dataset.from_tensor_slices(dataset_xyz[2]).shuffle(buffer_size=len(dataset_xyz[2])).batch(batch_size)
 
-    # Create the Genetator network
-    netG = Gen().to(device)
-    if ('cuda' in str(device)) and (ngpu > 1):
-        netG = nn.DataParallel(netG, list(range(ngpu)))
-    optG = optim.Adam(netG.parameters(), lr=lrg, betas=(beta1, beta2))
+    # Create the Generator network
+    netG = Gen()
+    optG = tf.keras.optimizers.Adam(learning_rate=lrg, beta_1=beta1, beta_2=beta2)
 
     # Define 1 Discriminator and optimizer for each plane in each dimension
     netDs = []
     optDs = []
     for i in range(3):
         netD = Disc()
-        netD = (nn.DataParallel(netD, list(range(ngpu)))).to(device)
         netDs.append(netD)
-        optDs.append(optim.Adam(netDs[i].parameters(), lr=lrd, betas=(beta1, beta2)))
+        optDs.append(tf.keras.optimizers.Adam(learning_rate=lrd, beta_1=beta1, beta_2=beta2))
 
     disc_real_log = []
     disc_fake_log = []
@@ -90,69 +80,68 @@ def train(pth, imtype, datatype, real_data, Disc, Gen, nc, l, nz, sf):
             ### Initialise
             ### Discriminator
             ## Generate fake image batch with G
-            noise = torch.randn(D_batch_size, nz, lz,lz,lz, device=device)
-            fake_data = netG(noise).detach()
+            noise = tf.random.normal([D_batch_size, nz, lz, lz, lz])
+            fake_data = netG(noise)
             # for each dim (d1, d2 and d3 are used as permutations to make 3D volume into a batch of 2D images)
             for dim, (netD, optimizer, data, d1, d2, d3) in enumerate(
                     zip(netDs, optDs, dataset, [2, 3, 4], [3, 2, 2], [4, 4, 3])):
                 if isotropic:
                     netD = netDs[0]
                     optimizer = optDs[0]
-                netD.zero_grad()
-                ##train on real images
-                real_data = data[0].to(device)
-                out_real = netD(real_data).view(-1).mean()
-                ## train on fake images
-                # perform permutation + reshape to turn volume into batch of 2D images to pass to D
-                fake_data_perm = fake_data.permute(0, d1, 1, d2, d3).reshape(l * D_batch_size, nc, l, l)
-                out_fake = netD(fake_data_perm).mean()
-                gradient_penalty = util.calc_gradient_penalty(netD, real_data, fake_data_perm[:batch_size],
-                                                                      batch_size, l,
-                                                                      device, Lambda, nc)
-                disc_cost = out_fake - out_real + gradient_penalty
-                disc_cost.backward()
-                optimizer.step()
+                with tf.GradientTape() as disc_tape:
+                    ##train on real images
+                    real_data = data
+                    out_real = tf.reduce_mean(netD(real_data))
+                    ## train on fake images
+                    # perform permutation + reshape to turn volume into batch of 2D images to pass to D
+                    fake_data_perm = tf.transpose(fake_data, perm=[0, d1, 1, d2, d3])
+                    fake_data_perm = tf.reshape(fake_data_perm, [l * D_batch_size, nc, l, l])
+                    out_fake = tf.reduce_mean(netD(fake_data_perm))
+                    gradient_penalty = util.calc_gradient_penalty(netD, real_data, fake_data_perm[:batch_size],
+                                                                          batch_size, l,
+                                                                          Lambda, nc)
+                    disc_cost = out_fake - out_real + gradient_penalty
+                gradients_of_discriminator = disc_tape.gradient(disc_cost, netD.trainable_variables)
+                optimizer.apply_gradients(zip(gradients_of_discriminator, netD.trainable_variables))
             #logs for plotting
-            disc_real_log.append(out_real.item())
-            disc_fake_log.append(out_fake.item())
-            Wass_log.append(out_real.item() - out_fake.item())
-            gp_log.append(gradient_penalty.item())
+            disc_real_log.append(out_real.numpy())
+            disc_fake_log.append(out_fake.numpy())
+            Wass_log.append(out_real.numpy() - out_fake.numpy())
+            gp_log.append(gradient_penalty.numpy())
             ### Generator Training
             if i % int(critic_iters) == 0:
-                netG.zero_grad()
-                errG = 0
-                noise = torch.randn(batch_size, nz, lz,lz,lz, device=device)
-                fake = netG(noise)
+                with tf.GradientTape() as gen_tape:
+                    errG = 0
+                    noise = tf.random.normal([batch_size, nz, lz, lz, lz])
+                    fake = netG(noise)
 
-                for dim, (netD, d1, d2, d3) in enumerate(
-                        zip(netDs, [2, 3, 4], [3, 2, 2], [4, 4, 3])):
-                    if isotropic:
-                        #only need one D
-                        netD = netDs[0]
-                    # permute and reshape to feed to disc
-                    fake_data_perm = fake.permute(0, d1, 1, d2, d3).reshape(l * batch_size, nc, l, l)
-                    output = netD(fake_data_perm)
-                    errG -= output.mean()
+                    for dim, (netD, d1, d2, d3) in enumerate(
+                            zip(netDs, [2, 3, 4], [3, 2, 2], [4, 4, 3])):
+                        if isotropic:
+                            #only need one D
+                            netD = netDs[0]
+                        # permute and reshape to feed to disc
+                        fake_data_perm = tf.transpose(fake, perm=[0, d1, 1, d2, d3])
+                        fake_data_perm = tf.reshape(fake_data_perm, [l * batch_size, nc, l, l])
+                        output = netD(fake_data_perm)
+                        errG -= tf.reduce_mean(output)
                     # Calculate gradients for G
-                errG.backward()
-                optG.step()
+                gradients_of_generator = gen_tape.gradient(errG, netG.trainable_variables)
+                optG.apply_gradients(zip(gradients_of_generator, netG.trainable_variables))
 
             # Output training stats & show imgs
             if i % 25 == 0:
-                netG.eval()
-                with torch.no_grad():
-                    torch.save(netG.state_dict(), pth + '_Gen.pt')
-                    torch.save(netD.state_dict(), pth + '_Disc.pt')
-                    noise = torch.randn(1, nz,lz,lz,lz, device=device)
-                    img = netG(noise)
-                    ###Print progress
-                    ## calc ETA
-                    steps = len(dataloaderx)
-                    util.calc_eta(steps, time.time(), start, i, epoch, num_epochs)
-                    ###save example slices
-                    util.test_plotter(img, 5, imtype, pth)
-                    # plotting graphs
-                    util.graph_plot([disc_real_log, disc_fake_log], ['real', 'perp'], pth, 'LossGraph')
-                    util.graph_plot([Wass_log], ['Wass Distance'], pth, 'WassGraph')
-                    util.graph_plot([gp_log], ['Gradient Penalty'], pth, 'GpGraph')
-                netG.train()
+                netG.save_weights(pth + '_Gen.h5')
+                netD.save_weights(pth + '_Disc.h5')
+                noise = tf.random.normal([1, nz, lz, lz, lz])
+                img = netG(noise)
+                ###Print progress
+                ## calc ETA
+                steps = len(dataloaderx)
+                util.calc_eta(steps, time.time(), start, i, epoch, num_epochs)
+                ###save example slices
+                util.test_plotter(img, 5, imtype, pth)
+                # plotting graphs
+                util.graph_plot([disc_real_log, disc_fake_log], ['real', 'perp'], pth, 'LossGraph')
+                util.graph_plot([Wass_log], ['Wass Distance'], pth, 'WassGraph')
+                util.graph_plot([gp_log], ['Gradient Penalty'], pth, 'GpGraph')
